@@ -1125,7 +1125,7 @@ def main():
     with tab3:
         st.subheader("Time-based Patterns")
         plot_weekday_weekend_comparison(df, selected_apartment, "time_analysis")
-        plot_hourly_profile(df, selected_apartment, "time_analysis")
+        #plot_hourly_profile(df, selected_apartment, "time_analysis")
 
     # --- TAB 4: AC & Weather Analysis ---
     with tab4:
