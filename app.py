@@ -718,16 +718,15 @@ def load_historical_consumption(path="processed_apartments2/metadata/historical_
 
 def plot_epi(selected_apartment, areas, df_full):
     """
-    Computes and plots EPI using ONLY the loaded apartment dataset (e.g. 2025 data).
-    No historical CSV used.
+    Computes and plots EPI (kWh/m²) using ONLY the loaded apartment dataset.
+    Fixes Plotly month label duplication by using categorical month labels.
     """
 
-    # ---- SAFETY CHECKS ----
     if df_full.empty or "Timestamp" not in df_full.columns:
         st.warning("No timestamped data available for EPI calculation.")
         return
 
-    # ---- Reverse anonymisation: anonymised → real apt name ----
+    # Reverse anonymisation: anonymised → real apt name
     REAL_NAME_MAP = {v: k for k, v in ANON_MAP.items()}
     if selected_apartment not in REAL_NAME_MAP:
         st.error(f"No mapping found for anonymised apartment '{selected_apartment}'.")
@@ -736,13 +735,13 @@ def plot_epi(selected_apartment, areas, df_full):
     real_name = REAL_NAME_MAP[selected_apartment]
     real_key = normalize_name(real_name)
 
-    # ---- Apartment Area ----
+    # Apartment Area
     apt_area = areas.get(real_key)
     if apt_area is None:
         st.warning(f"Area not found for apartment: {real_name} ({selected_apartment}).")
         return
 
-    # ---- Appliance columns ----
+    # Appliance columns (already excludes zero-usage)
     appliance_cols = get_nonzero_appliance_columns(df_full)
     if not appliance_cols:
         st.warning("No measurable appliance energy available for EPI calculation.")
@@ -750,72 +749,70 @@ def plot_epi(selected_apartment, areas, df_full):
 
     df = df_full.dropna(subset=["Timestamp"]).copy()
 
-    # ---- Month extraction ----
-    df["Month"] = df["Timestamp"].dt.to_period("M")
-    df["MonthStart"] = df["Month"].dt.to_timestamp()
+    # Month bucketing
+    df["MonthStart"] = df["Timestamp"].dt.to_period("M").dt.to_timestamp()
 
-    # ---- Monthly total energy ----
+    # Total power across appliances (kW)
     df["TotalPower_kW"] = df[appliance_cols].sum(axis=1)
 
+    # Monthly energy (kWh) = sum(kW samples) * interval_hours
     monthly = (
-        df.groupby("MonthStart")["TotalPower_kW"]
+        df.groupby("MonthStart", as_index=False)["TotalPower_kW"]
         .sum()
-        .reset_index()
         .rename(columns={"TotalPower_kW": "TotalPower_kW_Sum"})
     )
-
-    # Convert Power → Energy
     monthly["Total_kWh"] = monthly["TotalPower_kW_Sum"] * INTERVAL_HOURS
 
-    # ---- Compute EPI ----
-    monthly["EPI"] = monthly["Total_kWh"] / apt_area
+    # EPI (kWh/m²)
+    monthly["EPI_kWh_per_m2"] = monthly["Total_kWh"] / apt_area
 
     if monthly.empty:
         st.warning("No monthly EPI values could be computed.")
         return
 
-    # ---- Data availability ----
+    # Create categorical month labels to prevent duplicated tick text
+    monthly = monthly.sort_values("MonthStart")
+    monthly["MonthLabel"] = monthly["MonthStart"].dt.strftime("%b %Y")
+
+    # Data availability callout
     first = monthly["MonthStart"].min().strftime("%b %Y")
     last = monthly["MonthStart"].max().strftime("%b %Y")
     st.info(f"📅 **Data available from {first} to {last}**")
 
-    # ---- Month selector ----
-    month_list = ["All Months"] + [d.strftime("%b %Y") for d in monthly["MonthStart"]]
-    selected_month = st.selectbox("Select Month for EPI", month_list)
+    # Month selector (unique labels)
+    month_labels = monthly["MonthLabel"].tolist()
+    selected_month = st.selectbox("Select Month for EPI", ["All Months"] + month_labels)
 
     if selected_month == "All Months":
         df_plot = monthly
         title = f"EPI Across All Months ({selected_apartment})"
     else:
-        df_plot = monthly[monthly["MonthStart"].dt.strftime("%b %Y") == selected_month]
+        df_plot = monthly[monthly["MonthLabel"] == selected_month]
         title = f"EPI for {selected_month} ({selected_apartment})"
 
-    # ---- PLOT (BAR CHART) ----
+    # Plot (categorical x-axis → no duplicate month labels)
     fig = px.bar(
         df_plot,
-        x="MonthStart",
-        y="EPI",
+        x="MonthLabel",
+        y="EPI_kWh_per_m2",
         title=title,
-        labels={"MonthStart": "Month", "EPI": "EPI (kWh per m²)"},
+        labels={"MonthLabel": "Month", "EPI_kWh_per_m2": "EPI (kWh/m²)"},
     )
-
     fig.update_yaxes(rangemode="tozero")
-    fig.update_xaxes(tickformat="%b %Y")  # nicer month labels
+    fig.update_layout(xaxis=dict(type="category"))  # critical fix
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---- INSIGHTS ----
+    # Insight
     if selected_month == "All Months":
-        peak = df_plot.loc[df_plot["EPI"].idxmax()]
+        peak = df_plot.loc[df_plot["EPI_kWh_per_m2"].idxmax()]
         st.caption(
-            f"💡 **Insight:** Your highest EPI was in **{peak['MonthStart'].strftime('%b %Y')}**, "
+            f"💡 **Insight:** Your highest EPI was in **{peak['MonthLabel']}**, "
             f"indicating higher energy use per square metre."
         )
     else:
-        val = df_plot["EPI"].iloc[0]
-        st.caption(
-            f"💡 **Insight:** Your EPI for **{selected_month}** is **{val:.2f} kWh/m²**."
-        )
+        val = float(df_plot["EPI_kWh_per_m2"].iloc[0])
+        st.caption(f"💡 **Insight:** Your EPI for **{selected_month}** is **{val:.2f} kWh/m²**.")
 
 
 # ================= MAIN APP =================
