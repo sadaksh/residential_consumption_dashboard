@@ -473,8 +473,8 @@ def plot_energy_consumption_over_time(df, apartment_name, tab_name):
         x="Timestamp",
         y="Power (kW)",
         color="Appliance",
-        title=f"{apartment_name} - Power Over Time (kW)",
-        labels={"Power (kW)": "Power (kW)", "Timestamp": "Time"},
+        title=f"{apartment_name} - Total Power Over Time (kW)",
+        labels={"Power (kW)": "Total Power (kW)", "Timestamp": "Time"},
     )
     fig.update_layout(height=500, showlegend=True, legend_title_text="Appliance")
     fig.update_yaxes(rangemode="tozero")
@@ -551,7 +551,7 @@ def plot_weekday_weekend_comparison(df, apartment_name, tab_name):
         y="Average Power (kW)",
         color="Day Type",
         barmode="group",
-        title=f"{apartment_name} - Weekday vs Weekend Power (kW)",
+        title=f"{apartment_name} - Weekday vs Weekend Average Power (kW)",
         labels={"Average Power (kW)": "Average Power (kW)"},
     )
     fig.update_layout(xaxis_tickangle=-45, height=500, legend_title_text="Day Type")
@@ -904,7 +904,7 @@ def main():
     with tab3:
         st.subheader("Time-based Patterns")
         plot_hourly_profile(df, selected_apartment, "time_analysis")
-        plot_weekday_weekend_comparison(df, selected_apartment, "time_analysis")
+        #plot_weekday_weekend_comparison(df, selected_apartment, "time_analysis")
 
     with tab4:
         st.subheader("AC & Weather")
@@ -923,7 +923,7 @@ def main():
             st.info(f"Weather files are configured only for apartment {RMI_LAKESIDE_CODE} in the current build.")
 
     with tab5:
-        st.subheader("Appliance ON Events (Count)")
+        st.subheader("Appliance ON Events (Count of Occurences of Power (kW) more than the specified threshold)")
         timeframe = st.radio("Select Timeframe", ["daily", "weekly"], horizontal=True)
         plot_on_off_occurrences(df, selected_apartment, timeframe, "on_events")
 
