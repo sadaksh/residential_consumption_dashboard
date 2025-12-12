@@ -4,3 +4,4 @@ pandas
 numpy
 glob2
 scipy
+openpyxl>=3.1.2
