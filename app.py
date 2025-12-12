@@ -309,7 +309,7 @@ def plot_weather_correlation(df_energy, df_weather):
         x=temp_col,
         y=ac_col,
         color=color_col,
-        trendline="ols",
+        #trendline="ols",
         title=f"AC Power (kW) vs Temperature (°C)",
         labels={temp_col: "Temperature (°C)", ac_col: "AC Power (kW)"},
     )
