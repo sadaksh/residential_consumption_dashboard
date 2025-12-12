@@ -25,25 +25,31 @@ def normalize_name(name: str) -> str:
         return ""
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
 
-def strip_apartment_prefix(label: str, apartment_name: str) -> str:
+def strip_apartment_prefix(label: str, apartment_name: str = "") -> str:
     """
-    Remove repeated apartment names from legends:
-    "Cielo F106 - Living AC" -> "Living AC"
-    Also trims leading separators.
+    Robustly remove apartment prefixes from device labels.
+
+    Fixes the prefix error even when:
+    - apartment_name is an anonymised RMI code (doesn't match raw prefix),
+    - label uses real apartment name prefix,
+    - separators vary: " - ", "-", "–", "—", ":", "|".
+
+    Examples:
+    "Aurora C 102 - Washing Machine" -> "Washing Machine"
+    "Cielo F106- Living AC" -> "Living AC"
+    "LAKNW05 - Master AC" -> "Master AC"
     """
     if not isinstance(label, str):
         return label
-    apt = str(apartment_name).strip().lower()
+
     s = label.strip()
 
-    # remove case-insensitive "{apt} - " prefix
-    if s.lower().startswith(apt + " - "):
-        s = s[len(apartment_name) + 3 :].strip()
-    # remove case-insensitive "{apt}-" prefix (no spaces)
-    if s.lower().startswith(apt + "-"):
-        s = s[len(apartment_name) + 1 :].strip()
+    # If any common separator exists, keep everything after the first separator
+    parts = re.split(r"\s*[-–—:|]\s*", s, maxsplit=1)
+    if len(parts) == 2:
+        s = parts[1].strip()
 
-    # normalize leftover separators
+    # cleanup any leading separators
     s = re.sub(r"^\s*[-–—:|]+\s*", "", s).strip()
     return s
 
@@ -310,7 +316,7 @@ def plot_weather_correlation(df_energy, df_weather):
         y=ac_col,
         color=color_col,
         #trendline="ols",
-        title=f"AC Power (kW) vs Temperature (°C)",
+        title="AC Power (kW) vs Temperature (°C)",
         labels={temp_col: "Temperature (°C)", ac_col: "AC Power (kW)"},
     )
     fig.update_traces(marker=dict(size=6, opacity=0.7))
@@ -449,7 +455,7 @@ def plot_weekday_weekend_comparison_all_apartments(all_dfs):
 def plot_energy_consumption_over_time(df, apartment_name, tab_name):
     """
     Instantaneous power time-series (kW) — NOT kWh.
-    Removes apartment name from legend and hides zero-usage appliances.
+    Prefix removal is applied to ALL appliance labels.
     """
     appliance_cols = get_nonzero_appliance_columns(df)
     if not appliance_cols:
@@ -476,7 +482,7 @@ def plot_energy_consumption_over_time(df, apartment_name, tab_name):
 
 def plot_appliance_wise_energy(df, apartment_name, tab_name):
     """
-    Total energy by appliance (kWh) — hides zero-usage appliances and cleans legend labels.
+    Total consumption by appliance (kWh) — hides zero-usage appliances and cleans labels.
     """
     appliance_cols = get_nonzero_appliance_columns(df)
     if not appliance_cols:
@@ -485,19 +491,22 @@ def plot_appliance_wise_energy(df, apartment_name, tab_name):
 
     st.caption(insight_top_appliance_share(df, apartment_name))
 
-    energy_totals = []
+    totals = []
     for col in appliance_cols:
-        energy_totals.append(
-            {"Appliance": strip_apartment_prefix(col, apartment_name), "Total Energy (kWh)": df[col].sum() * INTERVAL_HOURS}
+        totals.append(
+            {
+                "Appliance": strip_apartment_prefix(col, apartment_name),
+                "Total Consumption (kWh)": df[col].sum() * INTERVAL_HOURS,
+            }
         )
-    energy_df = pd.DataFrame(energy_totals).sort_values("Total Energy (kWh)", ascending=False)
+    energy_df = pd.DataFrame(totals).sort_values("Total Consumption (kWh)", ascending=False)
 
     fig = px.bar(
         energy_df,
         x="Appliance",
-        y="Total Energy (kWh)",
-        title=f"{apartment_name} - Appliance-wise Total Energy (kWh)",
-        labels={"Total Energy (kWh)": "Total Energy (kWh)"},
+        y="Total Consumption (kWh)",
+        title=f"{apartment_name} - Appliance-wise Total Consumption (kWh)",
+        labels={"Total Consumption (kWh)": "Total Consumption (kWh)"},
     )
     fig.update_layout(xaxis_tickangle=-45, height=500)
     fig.update_yaxes(rangemode="tozero")
@@ -506,9 +515,7 @@ def plot_appliance_wise_energy(df, apartment_name, tab_name):
 def plot_weekday_weekend_comparison(df, apartment_name, tab_name):
     """
     Average power by appliance (kW), weekdays vs weekends.
-    - cleans legend labels
-    - hides zero-usage appliances
-    - y-axis starts from zero (no negatives)
+    Cleans appliance labels via strip_apartment_prefix().
     """
     appliance_cols = get_nonzero_appliance_columns(df)
     if not appliance_cols or "Timestamp" not in df.columns:
@@ -587,8 +594,7 @@ def plot_appliance_operation_heatmap(df, apartment_name, tab_name):
     """
     Heatmap: appliance "working harder" occurrences by hour/day (resident-friendly)
     - hides zero-usage appliances
-    - removes apt prefix
-    - renames Count -> Working Harder
+    - removes prefixes in appliance names for titles/labels
     """
     cols = get_nonzero_appliance_columns(df)
     if not cols or "Timestamp" not in df.columns:
@@ -604,7 +610,6 @@ def plot_appliance_operation_heatmap(df, apartment_name, tab_name):
     for i, appliance in enumerate(top_appliances):
         data = df[["Timestamp", appliance]].copy()
         data = data.dropna(subset=["Timestamp"])
-        # treat as "active" above tiny threshold
         data = data[data[appliance] > 0.01]
         if data.empty:
             continue
@@ -626,10 +631,10 @@ def plot_appliance_operation_heatmap(df, apartment_name, tab_name):
 
 def plot_on_off_occurrences(df, apartment_name, timeframe="daily", tab_name=""):
     """
-    Still technical, but:
-    - y-axis forced to zero (no negative)
-    - removes apt prefix in legend
+    ON events:
+    - removes prefixes in legend labels
     - hides zero-usage appliances before event detection
+    - y-axis forced to zero
     """
     cols = get_nonzero_appliance_columns(df)
     if not cols:
@@ -644,20 +649,22 @@ def plot_on_off_occurrences(df, apartment_name, timeframe="daily", tab_name=""):
         if events.empty:
             continue
 
+        clean_name = strip_apartment_prefix(appliance, apartment_name)
+
         if timeframe == "daily":
+            events = events.copy()
             events["date"] = events["Timestamp"].dt.date
             daily = events.groupby("date").size().reset_index(name="ON_Events")
             for _, row in daily.iterrows():
-                occurrences.append(
-                    {"Date": row["date"], "Appliance": strip_apartment_prefix(appliance, apartment_name), "ON_Events": row["ON_Events"]}
-                )
+                occurrences.append({"Date": row["date"], "Appliance": clean_name, "ON_Events": row["ON_Events"]})
         else:
+            events = events.copy()
             events["week"] = events["Timestamp"].dt.isocalendar().week
             events["year"] = events["Timestamp"].dt.year
             weekly = events.groupby(["year", "week"]).size().reset_index(name="ON_Events")
             for _, row in weekly.iterrows():
                 occurrences.append(
-                    {"Week": f"{row['year']}-W{row['week']}", "Appliance": strip_apartment_prefix(appliance, apartment_name), "ON_Events": row["ON_Events"]}
+                    {"Week": f"{row['year']}-W{row['week']}", "Appliance": clean_name, "ON_Events": row["ON_Events"]}
                 )
 
     if not occurrences:
@@ -719,14 +726,12 @@ def load_historical_consumption(path="processed_apartments2/metadata/historical_
 def plot_epi(selected_apartment, areas, df_full):
     """
     Computes and plots EPI (kWh/m²) using ONLY the loaded apartment dataset.
-    Fixes Plotly month label duplication by using categorical month labels.
     """
 
     if df_full.empty or "Timestamp" not in df_full.columns:
         st.warning("No timestamped data available for EPI calculation.")
         return
 
-    # Reverse anonymisation: anonymised → real apt name
     REAL_NAME_MAP = {v: k for k, v in ANON_MAP.items()}
     if selected_apartment not in REAL_NAME_MAP:
         st.error(f"No mapping found for anonymised apartment '{selected_apartment}'.")
@@ -735,51 +740,39 @@ def plot_epi(selected_apartment, areas, df_full):
     real_name = REAL_NAME_MAP[selected_apartment]
     real_key = normalize_name(real_name)
 
-    # Apartment Area
     apt_area = areas.get(real_key)
     if apt_area is None:
-        st.warning(f"Area not found for apartment: {real_name} ({selected_apartment}).")
+        st.warning(f"Area data not available for apartment {selected_apartment}. EPI normalisation may be approximate.")
         return
 
-    # Appliance columns (already excludes zero-usage)
     appliance_cols = get_nonzero_appliance_columns(df_full)
     if not appliance_cols:
         st.warning("No measurable appliance energy available for EPI calculation.")
         return
 
     df = df_full.dropna(subset=["Timestamp"]).copy()
-
-    # Month bucketing
     df["MonthStart"] = df["Timestamp"].dt.to_period("M").dt.to_timestamp()
-
-    # Total power across appliances (kW)
     df["TotalPower_kW"] = df[appliance_cols].sum(axis=1)
 
-    # Monthly energy (kWh) = sum(kW samples) * interval_hours
     monthly = (
         df.groupby("MonthStart", as_index=False)["TotalPower_kW"]
         .sum()
         .rename(columns={"TotalPower_kW": "TotalPower_kW_Sum"})
     )
     monthly["Total_kWh"] = monthly["TotalPower_kW_Sum"] * INTERVAL_HOURS
-
-    # EPI (kWh/m²)
     monthly["EPI_kWh_per_m2"] = monthly["Total_kWh"] / apt_area
 
     if monthly.empty:
         st.warning("No monthly EPI values could be computed.")
         return
 
-    # Create categorical month labels to prevent duplicated tick text
     monthly = monthly.sort_values("MonthStart")
     monthly["MonthLabel"] = monthly["MonthStart"].dt.strftime("%b %Y")
 
-    # Data availability callout
     first = monthly["MonthStart"].min().strftime("%b %Y")
     last = monthly["MonthStart"].max().strftime("%b %Y")
     st.info(f"📅 **Data available from {first} to {last}**")
 
-    # Month selector (unique labels)
     month_labels = monthly["MonthLabel"].tolist()
     selected_month = st.selectbox("Select Month for EPI", ["All Months"] + month_labels)
 
@@ -790,7 +783,6 @@ def plot_epi(selected_apartment, areas, df_full):
         df_plot = monthly[monthly["MonthLabel"] == selected_month]
         title = f"EPI for {selected_month} ({selected_apartment})"
 
-    # Plot (categorical x-axis → no duplicate month labels)
     fig = px.bar(
         df_plot,
         x="MonthLabel",
@@ -799,21 +791,17 @@ def plot_epi(selected_apartment, areas, df_full):
         labels={"MonthLabel": "Month", "EPI_kWh_per_m2": "EPI (kWh/m²)"},
     )
     fig.update_yaxes(rangemode="tozero")
-    fig.update_layout(xaxis=dict(type="category"))  # critical fix
-
+    fig.update_layout(xaxis=dict(type="category"))
     st.plotly_chart(fig, use_container_width=True)
 
-    # Insight
     if selected_month == "All Months":
         peak = df_plot.loc[df_plot["EPI_kWh_per_m2"].idxmax()]
         st.caption(
-            f"💡 **Insight:** Your highest EPI was in **{peak['MonthLabel']}**, "
-            f"indicating higher energy use per square metre."
+            f"💡 **Insight:** Your highest EPI was in **{peak['MonthLabel']}**, indicating higher energy use per square metre."
         )
     else:
         val = float(df_plot["EPI_kWh_per_m2"].iloc[0])
         st.caption(f"💡 **Insight:** Your EPI for **{selected_month}** is **{val:.2f} kWh/m²**.")
-
 
 # ================= MAIN APP =================
 def main():
@@ -832,12 +820,10 @@ def main():
     areas = load_apartment_areas()
     historical_df = load_historical_consumption()
 
-    # --- Sidebar Controls ---
     st.sidebar.header("Apartment Selection")
     apartment_names = sorted(list(all_dfs.keys()))
     selected_option = st.sidebar.selectbox("Select Option", ["All Apartments"] + apartment_names)
 
-    # --- Date Range ---
     st.sidebar.subheader("📆 Date Range Filter")
     all_timestamps = pd.concat([df["Timestamp"] for df in all_dfs.values() if "Timestamp" in df.columns], ignore_index=True)
     all_timestamps = all_timestamps.dropna()
@@ -858,19 +844,14 @@ def main():
     if selected_option == "All Apartments":
         st.header("🏘️ All Apartments - Comparative Analysis")
 
-        # Apply date filter
         for apt, df_apt in all_dfs.items():
             if "Timestamp" in df_apt.columns:
                 mask = (df_apt["Timestamp"] >= start_date) & (df_apt["Timestamp"] <= end_date)
                 all_dfs[apt] = df_apt[mask]
 
-        # Quick resident line
         st.caption("Insight: Use this view to compare typical daily patterns and weekend effects across homes.")
-
-        # Plots (kept minimal)
         plot_hourly_consumption_all_apartments(all_dfs)
         plot_weekday_weekend_comparison_all_apartments(all_dfs)
-
         return
 
     # ================= INDIVIDUAL APARTMENT VIEW =================
@@ -880,7 +861,6 @@ def main():
         return
 
     df_full = all_dfs[selected_apartment].copy()
-
     df = df_full.copy()
     if "Timestamp" in df.columns:
         df = df[(df["Timestamp"] >= start_date) & (df["Timestamp"] <= end_date)]
@@ -899,22 +879,18 @@ def main():
 
     with tab1:
         st.subheader("Energy Overview")
-
-        # Power time series
         plot_energy_consumption_over_time(df, selected_apartment, "overview")
 
-        # KPIs (correct units)
         cols = get_nonzero_appliance_columns(df)
-        total_energy_kwh = df[cols].sum(numeric_only=True).sum() * INTERVAL_HOURS if cols else 0
+        total_kwh = df[cols].sum(numeric_only=True).sum() * INTERVAL_HOURS if cols else 0
         avg_power_kw = df[cols].sum(axis=1).mean() if cols else 0
 
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("Total Energy (kWh)", f"{total_energy_kwh:.2f}")
+            st.metric("Total Consumption (kWh)", f"{total_kwh:.2f}")
         with c2:
             st.metric("Average Power (kW)", f"{avg_power_kw:.2f}")
 
-        # Side-by-side charts (not identical units, so only axis standardization within each chart)
         colA, colB = st.columns(2)
         with colA:
             plot_appliance_wise_energy(df, selected_apartment, "overview")
