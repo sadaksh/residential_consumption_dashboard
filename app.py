@@ -934,16 +934,17 @@ def main():
         st.subheader("AC & Weather")
         st.caption("Insight: This helps explain why AC energy rises on hotter or more humid days.")
 
-        if selected_apartment.lower() == "lakeside k 502":
+        if selected_apartment.strip().lower() == RMI_LAKESIDE_CODE.strip().lower():
             weather_dict = load_weather_data()
             if weather_dict:
                 for zone, weather_df in weather_dict.items():
-                    st.markdown(f"### 🏠 {zone} Bedroom")
+                    safe_zone = str(zone).replace("Lakeside K 502", RMI_LAKESIDE_CODE)
+                    st.markdown(f"### 🏠 {safe_zone} Bedroom")
                     plot_weather_correlation(df, weather_df)
             else:
                 st.warning("No weather files found for this apartment.")
         else:
-            st.info("Weather files are configured only for Lakeside K 502 in the current build.")
+            st.info(f"Weather files are configured only for apartment {RMI_LAKESIDE_CODE} in the current build.")
 
     with tab5:
         st.subheader("Appliance ON Events (Count)")
