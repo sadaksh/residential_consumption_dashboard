@@ -933,7 +933,7 @@ def main():
     with tab4:
         st.subheader("AC & Weather")
         st.caption("Insight: This helps explain why AC energy rises on hotter or more humid days.")
-
+        RMI_LAKESIDE_CODE = ANON_MAP.get("Lakeside K 502", "LAKNW05")
         if selected_apartment.strip().lower() == RMI_LAKESIDE_CODE.strip().lower():
             weather_dict = load_weather_data()
             if weather_dict:
