@@ -19,6 +19,9 @@ DATA_FOLDER = "processed_apartments2"
 INTERVAL_MINUTES = 5
 INTERVAL_HOURS = INTERVAL_MINUTES / 60.0  # 0.083333...
 
+# Default thresholds
+ACTIVE_POWER_KW = 0.01  # 10 W treated as "active" (standby below this is ignored)
+
 # ================= NAME HELPERS =================
 def normalize_name(name: str) -> str:
     if pd.isna(name):
@@ -44,14 +47,36 @@ def strip_apartment_prefix(label: str, apartment_name: str = "") -> str:
 
     s = label.strip()
 
-    # If any common separator exists, keep everything after the first separator
     parts = re.split(r"\s*[-–—:|]\s*", s, maxsplit=1)
     if len(parts) == 2:
         s = parts[1].strip()
 
-    # cleanup any leading separators
     s = re.sub(r"^\s*[-–—:|]+\s*", "", s).strip()
     return s
+
+# ================= RESIDENT OUTPUT HELPERS =================
+def resident_insight(text: str):
+    """One-line resident-friendly insight. Keep it behavioural."""
+    st.caption(f"💡 {text}")
+
+def time_block_from_hour(hour: int) -> str:
+    if 0 <= hour < 6:
+        return "Early morning (12 AM–6 AM)"
+    if 6 <= hour < 10:
+        return "Breakfast (6 AM–10 AM)"
+    if 10 <= hour < 15:
+        return "Lunch (10 AM–3 PM)"
+    if 15 <= hour < 19:
+        return "Evening (3 PM–7 PM)"
+    return "Dinner & late night (7 PM–12 AM)"
+
+TIME_BLOCK_ORDER = [
+    "Early morning (12 AM–6 AM)",
+    "Breakfast (6 AM–10 AM)",
+    "Lunch (10 AM–3 PM)",
+    "Evening (3 PM–7 PM)",
+    "Dinner & late night (7 PM–12 AM)",
+]
 
 # ================= AC DETECTION (edge case safe) =================
 FORBIDDEN_AC_SUBSTRINGS = [
@@ -73,89 +98,6 @@ def is_ac_column(name: str) -> bool:
     clean = re.sub(r"[^a-z0-9]+", " ", n)
     tokens = clean.split()
     return ("ac" in tokens) or ("a/c" in tokens)
-
-# ================= COLUMN HELPERS =================
-def get_energy_columns(df: pd.DataFrame) -> list:
-    """
-    Returns likely appliance power columns (kW).
-    Excludes meta + phase columns.
-    """
-    exclude_keys = [
-        "timestamp", "apartment", "phase", "date", "time",
-        "b phase", "r phase", "y phase",
-        "device_id", "ts"
-    ]
-    cols = []
-    for c in df.columns:
-        cname = c.lower().strip()
-        if not any(k in cname for k in exclude_keys):
-            cols.append(c)
-    return cols
-
-def get_nonzero_appliance_columns(df: pd.DataFrame, eps_kwh: float = 0.01) -> list:
-    """
-    Hide zero-usage appliances:
-    keep columns whose total energy over filtered range is > eps_kwh.
-    """
-    cols = get_energy_columns(df)
-    keep = []
-    for c in cols:
-        s = pd.to_numeric(df[c], errors="coerce")
-        total_kwh = s.fillna(0).sum() * INTERVAL_HOURS
-        if total_kwh > eps_kwh:
-            keep.append(c)
-    return keep
-
-# ================= RESIDENT INSIGHTS =================
-def fmt_period(hour: int) -> str:
-    if 0 <= hour < 6:
-        return "Early morning (12 AM–6 AM)"
-    if 6 <= hour < 10:
-        return "Breakfast (6 AM–10 AM)"
-    if 10 <= hour < 15:
-        return "Lunch (10 AM–3 PM)"
-    if 15 <= hour < 19:
-        return "Evening (3 PM–7 PM)"
-    return "Dinner & late night (7 PM–12 AM)"
-
-def insight_top_appliance_share(df: pd.DataFrame, apartment_name: str) -> str:
-    cols = get_nonzero_appliance_columns(df)
-    if not cols:
-        return "No measurable appliance usage in the selected period."
-    energy = {c: df[c].sum() * INTERVAL_HOURS for c in cols}
-    total = sum(energy.values())
-    top = max(energy, key=energy.get)
-    share = (energy[top] / total) * 100 if total > 0 else 0
-    return f"Most of your electricity in this period comes from **{strip_apartment_prefix(top, apartment_name)}** (~{share:.0f}% of total)."
-
-def insight_weekday_weekend(df: pd.DataFrame) -> str:
-    cols = get_nonzero_appliance_columns(df)
-    if "Timestamp" not in df.columns or not cols:
-        return "Not enough data to compare weekdays vs weekends."
-    d = df.dropna(subset=["Timestamp"]).copy()
-    d["day_type"] = d["Timestamp"].dt.dayofweek.apply(lambda x: "Weekend" if x >= 5 else "Weekday")
-    d["Total Power (kW)"] = d[cols].sum(axis=1)
-    wk = d[d["day_type"] == "Weekday"]["Total Power (kW)"].mean()
-    we = d[d["day_type"] == "Weekend"]["Total Power (kW)"].mean()
-    if np.isnan(wk) or np.isnan(we) or wk == 0:
-        return "Not enough data to compare weekdays vs weekends."
-    delta = (we - wk) / wk * 100
-    if delta >= 0:
-        return f"Your home is **more active on weekends** (~{delta:.0f}% higher average usage than weekdays)."
-    return f"Your home is **less active on weekends** (~{abs(delta):.0f}% lower average usage than weekdays)."
-
-def insight_peak_hour(df: pd.DataFrame) -> str:
-    cols = get_nonzero_appliance_columns(df)
-    if "Timestamp" not in df.columns or not cols:
-        return "Not enough data to identify peak usage hours."
-    d = df.dropna(subset=["Timestamp"]).copy()
-    d["hour"] = d["Timestamp"].dt.hour
-    d["Total Power (kW)"] = d[cols].sum(axis=1)
-    hourly = d.groupby("hour")["Total Power (kW)"].mean()
-    if hourly.empty:
-        return "Not enough data to identify peak usage hours."
-    h = int(hourly.idxmax())
-    return f"Your **highest average electricity use** happens in **{fmt_period(h)}**."
 
 # ================= APARTMENT ANONYMISATION =================
 ANON_MAP = {
@@ -192,12 +134,114 @@ ANON_MAP = {
     "Estella E 1106": "ESESE11",
     "Fresca C909": "FRCNE09",
     "Lakeside B 101": "LABNW01",
-    "Uno M404": "UNMNW04"
+    "Uno M404": "UNMNW04",
 }
 
 def anonymise(apt_name: str) -> str:
     """Return the anonymised RMI code for an apartment name."""
     return ANON_MAP.get(apt_name, apt_name)
+
+# ================= COLUMN HELPERS =================
+def get_energy_columns(df: pd.DataFrame) -> list:
+    """
+    Returns likely appliance power columns (kW).
+    Excludes meta + phase columns.
+    """
+    exclude_keys = [
+        "timestamp", "apartment", "phase", "date", "time",
+        "b phase", "r phase", "y phase",
+        "device_id", "ts"
+    ]
+    cols = []
+    for c in df.columns:
+        cname = c.lower().strip()
+        if not any(k in cname for k in exclude_keys):
+            cols.append(c)
+    return cols
+
+def get_nonzero_appliance_columns(df: pd.DataFrame, eps_kwh: float = 0.01) -> list:
+    """
+    Hide zero-usage appliances:
+    keep columns whose total energy over filtered range is > eps_kwh.
+    """
+    cols = get_energy_columns(df)
+    keep = []
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        total_kwh = s.fillna(0).sum() * INTERVAL_HOURS
+        if total_kwh > eps_kwh:
+            keep.append(c)
+    return keep
+
+# ================= APPLIANCE CATEGORISATION (client-required) =================
+CATEGORIES = ["ACs", "Lights + Fans + Plug Loads", "Geysers", "Kitchen Loads"]
+
+KITCHEN_KEYS = [
+    "fridge", "refrigerator", "microwave", "oven", "dishwasher", "mixer",
+    "kitchen", "chimney", "hob", "induction", "toaster", "kettle"
+]
+LIGHT_FAN_PLUG_KEYS = [
+    "light", "lighting", "lamp", "fan", "socket", "plug", "tv", "router",
+    "computer", "laptop", "charger", "set top", "stb"
+]
+GEYSER_KEYS = ["geyser", "water heater", "heater"]
+
+def categorise_appliance(raw_col: str, apartment_name: str = "") -> str:
+    """
+    Map a raw metering channel to one of the 4 resident-facing categories.
+    Any unclassified device is treated as Plug Loads (resident-relevant default).
+    """
+    device = strip_apartment_prefix(raw_col, apartment_name)
+    n = str(device).lower()
+
+    if is_ac_column(device):
+        return "ACs"
+    if any(k in n for k in GEYSER_KEYS):
+        return "Geysers"
+    if any(k in n for k in KITCHEN_KEYS):
+        return "Kitchen Loads"
+    if any(k in n for k in LIGHT_FAN_PLUG_KEYS):
+        return "Lights + Fans + Plug Loads"
+
+    # Default bucket to avoid "Other" clutter in resident view
+    return "Lights + Fans + Plug Loads"
+
+def aggregate_to_categories(df: pd.DataFrame, apartment_name: str, eps_kwh: float = 0.01) -> pd.DataFrame:
+    """
+    Return a dataframe with Timestamp + 4 category power columns (kW).
+    Drops categories with zero energy in the selected period.
+    """
+    if df.empty or "Timestamp" not in df.columns:
+        return pd.DataFrame()
+
+    cols = get_nonzero_appliance_columns(df, eps_kwh=eps_kwh)
+    if not cols:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({"Timestamp": df["Timestamp"]})
+    for cat in CATEGORIES:
+        out[cat] = 0.0
+
+    for c in cols:
+        cat = categorise_appliance(c, apartment_name)
+        out[cat] = out[cat] + pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # drop zero-energy categories
+    keep = ["Timestamp"]
+    for cat in CATEGORIES:
+        if (out[cat].fillna(0.0).sum() * INTERVAL_HOURS) > eps_kwh:
+            keep.append(cat)
+    out = out[keep]
+
+    return out
+
+def category_totals_kwh(df_cat: pd.DataFrame) -> pd.DataFrame:
+    """Return totals (kWh) per category."""
+    if df_cat.empty:
+        return pd.DataFrame(columns=["Category", "Total Consumption (kWh)"])
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    rows = [{"Category": c, "Total Consumption (kWh)": float(df_cat[c].fillna(0).sum() * INTERVAL_HOURS)} for c in cats]
+    return pd.DataFrame(rows).sort_values("Total Consumption (kWh)", ascending=False)
 
 # ================= LOAD DATA =================
 @st.cache_data
@@ -209,10 +253,13 @@ def load_all_data():
         try:
             df = pd.read_csv(f)
             apt_name = os.path.splitext(os.path.basename(f))[0]
-            df["Apartment"] = anonymise(apt_name)
+
+            # Anonymise immediately (display and internal)
+            apt_code = anonymise(apt_name)
+            df["Apartment"] = apt_code
 
             # remove phase columns
-            df = df[[c for c in df.columns if not any(k in c.lower() for k in ["b phase", "r phase", "y phase"])]]
+            df = df[[c for c in df.columns if not any(k in c.lower() for k in ["b phase", "r phase", "y phase"]) ]]
 
             # timestamp
             if "Timestamp" in df.columns:
@@ -227,16 +274,20 @@ def load_all_data():
                     .abs()
                 )
 
-            dfs[anonymise(apt_name)] = df
+            dfs[apt_code] = df
 
         except Exception as e:
             st.warning(f"Could not load {f}: {e}")
 
     return dfs
 
-# ================= WEATHER (unchanged) =================
+# ================= WEATHER (kept, UI anonymised) =================
 @st.cache_data
 def load_weather_data(data_folder="processed_apartments2"):
+    """
+    Weather files currently available for one flat only (file names are fixed).
+    Returns a dict: zone -> dataframe
+    """
     weather_files = {
         "Living": [
             os.path.join(data_folder, "Ambient Temperature & Humidity LakesideK502_Living Bedroom.xlsx"),
@@ -267,7 +318,6 @@ def load_weather_data(data_folder="processed_apartments2"):
                 df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
                 numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
                 df = df[["Timestamp"] + numeric_cols]
-                df["Source"] = os.path.basename(f)
                 dfs.append(df)
             except Exception as e:
                 st.warning(f"Could not load {zone} file {f}: {e}")
@@ -280,9 +330,13 @@ def load_weather_data(data_folder="processed_apartments2"):
             results[zone] = merged
     return results
 
-def plot_weather_correlation(df_energy, df_weather):
+def plot_weather_correlation(df_energy, df_weather, apartment_code: str):
     if df_weather.empty:
-        st.warning("⚠️ No weather data available.")
+        st.warning("No weather data available.")
+        return
+
+    if df_energy.empty or "Timestamp" not in df_energy.columns:
+        st.warning("No apartment data available for correlation.")
         return
 
     merged = pd.merge_asof(
@@ -293,11 +347,11 @@ def plot_weather_correlation(df_energy, df_weather):
         direction="nearest",
     )
 
-    ac_cols = [c for c in merged.columns if is_ac_column(c)]
-    if not ac_cols:
-        st.warning("No AC column found.")
+    # Use category aggregation so we correlate Temperature with Cooling (ACs)
+    df_cat = aggregate_to_categories(merged, apartment_code)
+    if df_cat.empty or "ACs" not in df_cat.columns:
+        st.warning("No AC data available to correlate with weather.")
         return
-    ac_col = ac_cols[0]
 
     temp_candidates = [c for c in merged.columns if "temp" in c.lower()]
     hum_candidates = [c for c in merged.columns if "humid" in c.lower() or "rh" in c.lower()]
@@ -306,26 +360,25 @@ def plot_weather_correlation(df_energy, df_weather):
         return
 
     temp_col = temp_candidates[0]
-    color_col = hum_candidates[0] if hum_candidates else None
+    hum_col = hum_candidates[0] if hum_candidates else None
 
-    st.caption("Insight: Hotter outdoor conditions usually increase AC power use—this helps explain high-cooling days.")
+    resident_insight("On hotter days, cooling demand usually rises; this explains high-AC days.")
 
     fig = px.scatter(
         merged,
         x=temp_col,
-        y=ac_col,
-        color=color_col,
-        #trendline="ols",
-        title="AC Power (kW) vs Temperature (°C)",
-        labels={temp_col: "Temperature (°C)", ac_col: "AC Power (kW)"},
+        y=df_cat["ACs"],
+        color=hum_col,
+        title=f"{apartment_code} – Cooling Power (kW) vs Temperature (°C)",
+        labels={temp_col: "Temperature (°C)", "y": "Cooling Power (kW)"},
     )
     fig.update_traces(marker=dict(size=6, opacity=0.7))
     fig.update_yaxes(rangemode="tozero")
     st.plotly_chart(fig, use_container_width=True)
 
     merged["Date"] = merged["Timestamp"].dt.date
-    daily = merged.groupby("Date").agg({ac_col: "sum", temp_col: "mean"}).reset_index()
-    daily["AC Energy (kWh)"] = daily[ac_col] * INTERVAL_HOURS
+    daily = merged.groupby("Date").agg({temp_col: "mean"}).reset_index()
+    daily["Cooling Energy (kWh)"] = df_cat.groupby(merged["Date"])["ACs"].sum().values * INTERVAL_HOURS
 
     BASE_TEMP = 24
     daily["CDD"] = (daily[temp_col] - BASE_TEMP).clip(lower=0)
@@ -333,375 +386,314 @@ def plot_weather_correlation(df_energy, df_weather):
     fig2 = make_subplots(specs=[[{"secondary_y": True}]])
     fig2.add_trace(go.Bar(x=daily["Date"], y=daily["CDD"], name="Cooling Degree Days", opacity=0.6), secondary_y=False)
     fig2.add_trace(
-        go.Scatter(x=daily["Date"], y=daily["AC Energy (kWh)"], name="Daily AC Energy (kWh)", mode="lines+markers"),
+        go.Scatter(x=daily["Date"], y=daily["Cooling Energy (kWh)"], name="Cooling Energy (kWh)", mode="lines+markers"),
         secondary_y=True,
     )
-    fig2.update_layout(title="Daily AC Energy (kWh) vs Cooling Degree Days", xaxis_title="Date")
+    fig2.update_layout(title=f"{apartment_code} – Cooling Energy (kWh) vs Cooling Degree Days", xaxis_title="Date")
     fig2.update_yaxes(rangemode="tozero", secondary_y=True)
     st.plotly_chart(fig2, use_container_width=True)
 
-# ================= ON/OFF + OP DURATION HELPERS (kept, with y-axis fixes) =================
-def calculate_operation_duration_improved(df, appliance_col, threshold=0.001):
-    if appliance_col not in df.columns:
-        return pd.DataFrame()
+# ================= INSIGHTS (category-aware) =================
+def insight_top_category_share(df_cat: pd.DataFrame) -> str:
+    if df_cat.empty:
+        return "No measurable usage in the selected period."
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        return "No measurable usage in the selected period."
+    energy = {c: float(df_cat[c].fillna(0).sum() * INTERVAL_HOURS) for c in cats}
+    total = sum(energy.values())
+    top = max(energy, key=energy.get)
+    share = (energy[top] / total) * 100 if total > 0 else 0
+    return f"Most electricity in this period comes from **{top}** (~{share:.0f}% of total)."
 
-    data = df[["Timestamp", appliance_col]].dropna().sort_values("Timestamp")
-    if data.empty:
-        return pd.DataFrame()
+def insight_peak_time_block(df_cat: pd.DataFrame) -> str:
+    if df_cat.empty or "Timestamp" not in df_cat.columns:
+        return "Not enough data to identify peak time blocks."
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        return "Not enough data to identify peak time blocks."
+    d = df_cat.dropna(subset=["Timestamp"]).copy()
+    d["hour"] = d["Timestamp"].dt.hour
+    d["Time Block"] = d["hour"].apply(time_block_from_hour)
+    d["Total Power (kW)"] = d[cats].sum(axis=1)
+    block = d.groupby("Time Block")["Total Power (kW)"].mean().reindex(TIME_BLOCK_ORDER)
+    if block.dropna().empty:
+        return "Not enough data to identify peak time blocks."
+    b = block.idxmax()
+    return f"Your highest typical usage happens in **{b}**."
 
-    data["is_on"] = data[appliance_col] > threshold
-    data["state_change"] = data["is_on"].ne(data["is_on"].shift())
-    data["group_id"] = data["state_change"].cumsum()
+def insight_weekday_weekend_delta(df_cat: pd.DataFrame) -> str:
+    if df_cat.empty or "Timestamp" not in df_cat.columns:
+        return "Not enough data to compare weekdays vs weekends."
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        return "Not enough data to compare weekdays vs weekends."
+    d = df_cat.dropna(subset=["Timestamp"]).copy()
+    d["day_type"] = d["Timestamp"].dt.dayofweek.apply(lambda x: "Weekend" if x >= 5 else "Weekday")
+    d["Total Power (kW)"] = d[cats].sum(axis=1)
+    wk = d[d["day_type"] == "Weekday"]["Total Power (kW)"].mean()
+    we = d[d["day_type"] == "Weekend"]["Total Power (kW)"].mean()
+    if np.isnan(wk) or np.isnan(we) or wk == 0:
+        return "Not enough data to compare weekdays vs weekends."
+    delta = (we - wk) / wk * 100
+    if delta >= 0:
+        return f"Your home is typically more active on weekends (~{delta:.0f}% higher)."
+    return f"Your home is typically less active on weekends (~{abs(delta):.0f}% lower)."
 
-    events = []
-    for _, group in data.groupby("group_id"):
-        if group["is_on"].iloc[0]:
-            start_time = group["Timestamp"].iloc[0]
-            end_time = group["Timestamp"].iloc[-1]
-            duration_hours = (end_time - start_time).total_seconds() / 3600
-            if duration_hours >= INTERVAL_HOURS:
-                events.append(
-                    {
-                        "appliance": appliance_col,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "duration_hours": duration_hours,
-                        "avg_power": group[appliance_col].mean(),
-                        "max_power": group[appliance_col].max(),
-                        "day_of_week": start_time.strftime("%A"),
-                    }
-                )
-    return pd.DataFrame(events)
-
-def detect_on_off_events(df, appliance_col, threshold=0.01):
-    if appliance_col not in df.columns:
-        return pd.DataFrame()
-    data = df[["Timestamp", appliance_col]].dropna().sort_values("Timestamp")
-    if data.empty:
-        return pd.DataFrame()
-    data["state"] = data[appliance_col] > threshold
-    data["state_change"] = data["state"].ne(data["state"].shift())
-    data["event_id"] = data["state_change"].cumsum()
-    return data[data["state_change"] & data["state"]]
-
-# ================= COMPARATIVE PLOTS (ALL APARTMENTS) =================
-def plot_hourly_consumption_all_apartments(all_dfs):
-    hourly_data = []
-    for apt_name, df in all_dfs.items():
-        if "Timestamp" not in df.columns:
-            continue
-        appliance_cols = get_nonzero_appliance_columns(df)
-        if not appliance_cols:
-            continue
-        df = df.dropna(subset=["Timestamp"]).copy()
-        df["hour"] = df["Timestamp"].dt.hour
-        hourly_avg = df.groupby("hour")[appliance_cols].mean().mean(axis=1)
-        for hour, consumption in hourly_avg.items():
-            hourly_data.append({"Apartment": apt_name, "Hour": hour, "Average Power (kW)": consumption})
-
-    if not hourly_data:
-        st.warning("No hourly data available")
+# ================= CATEGORY VISUALS =================
+def plot_category_power_over_time(df_cat: pd.DataFrame, apartment_code: str, key_suffix: str):
+    """Time series of category power (kW)."""
+    if df_cat.empty:
+        st.info("No measurable usage for the selected period.")
         return
 
-    st.caption("Insight: This compares when homes are most active during the day (higher dots = higher typical usage).")
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    resident_insight(insight_peak_time_block(df_cat))
 
-    hourly_df = pd.DataFrame(hourly_data)
-    fig = px.scatter(
-        hourly_df,
-        x="Hour",
-        y="Average Power (kW)",
-        color="Apartment",
-        title="Average Power by Hour of Day (kW)",
-        labels={"Hour": "Hour of Day", "Average Power (kW)": "Average Power (kW)"},
-    )
-    fig.update_traces(marker=dict(size=7, opacity=0.7))
-    fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True)
-
-def plot_weekday_weekend_comparison_all_apartments(all_dfs):
-    comparison_data = []
-    for apt_name, df in all_dfs.items():
-        if "Timestamp" not in df.columns:
-            continue
-        appliance_cols = get_nonzero_appliance_columns(df)
-        if not appliance_cols:
-            continue
-        d = df.dropna(subset=["Timestamp"]).copy()
-        d["day_type"] = d["Timestamp"].dt.dayofweek.apply(lambda x: "Weekend" if x >= 5 else "Weekday")
-        daily_mean = d.groupby("day_type")[appliance_cols].mean().mean(axis=1)
-        for day_type, val in daily_mean.items():
-            comparison_data.append({"Apartment": apt_name, "Day Type": day_type, "Average Power (kW)": val})
-
-    if not comparison_data:
-        st.warning("No weekday/weekend data available")
-        return
-
-    st.caption("Insight: Weekend vs weekday usage differences often reflect time spent at home and AC/plug load behaviour.")
-
-    comp_df = pd.DataFrame(comparison_data)
-    fig = px.scatter(
-        comp_df,
-        x="Day Type",
-        y="Average Power (kW)",
-        color="Apartment",
-        title="Weekday vs Weekend - Average Power (kW)",
-        labels={"Average Power (kW)": "Average Power (kW)"},
-    )
-    fig.update_traces(marker=dict(size=12, opacity=0.8))
-    fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True)
-
-# ================= INDIVIDUAL APARTMENT PLOTS =================
-def plot_energy_consumption_over_time(df, apartment_name, tab_name):
-    """
-    Instantaneous power time-series (kW) — NOT kWh.
-    Prefix removal is applied to ALL appliance labels.
-    """
-    appliance_cols = get_nonzero_appliance_columns(df)
-    if not appliance_cols:
-        st.warning("No measurable appliance usage found for this apartment in the selected period.")
-        return
-
-    st.caption(insight_peak_hour(df))
-
-    melt_df = df.melt(id_vars=["Timestamp"], value_vars=appliance_cols, var_name="Appliance", value_name="Power (kW)")
+    melt_df = df_cat.melt(id_vars=["Timestamp"], value_vars=cats, var_name="Category", value_name="Power (kW)")
     melt_df = melt_df.dropna(subset=["Power (kW)"])
-    melt_df["Appliance"] = melt_df["Appliance"].apply(lambda x: strip_apartment_prefix(x, apartment_name))
 
     fig = px.line(
         melt_df,
         x="Timestamp",
         y="Power (kW)",
-        color="Appliance",
-        title=f"{apartment_name} - Total Power Over Time (kW)",
-        labels={"Power (kW)": "Total Power (kW)", "Timestamp": "Time"},
+        color="Category",
+        title=f"{apartment_code} – Power by Major Category (kW)",
+        labels={"Timestamp": "Time"},
     )
-    fig.update_layout(height=500, showlegend=True, legend_title_text="Appliance")
+    fig.update_layout(height=500, legend_title_text="Category")
     fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_name}_energy_time_{tab_name}")
+    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_cat_power_time_{key_suffix}")
 
-def plot_appliance_wise_energy(df, apartment_name, tab_name):
-    """
-    Total consumption by appliance (kWh) — hides zero-usage appliances and cleans labels.
-    """
-    appliance_cols = get_nonzero_appliance_columns(df)
-    if not appliance_cols:
-        st.info("No measurable appliance energy to display for this period.")
+def plot_category_energy_bar(df_cat: pd.DataFrame, apartment_code: str, key_suffix: str):
+    """Total energy (kWh) by category."""
+    if df_cat.empty:
+        st.info("No measurable usage for the selected period.")
+        return
+    df_tot = category_totals_kwh(df_cat)
+    if df_tot.empty:
+        st.info("No measurable category energy for the selected period.")
         return
 
-    st.caption(insight_top_appliance_share(df, apartment_name))
-
-    totals = []
-    for col in appliance_cols:
-        totals.append(
-            {
-                "Appliance": strip_apartment_prefix(col, apartment_name),
-                "Total Consumption (kWh)": df[col].sum() * INTERVAL_HOURS,
-            }
-        )
-    energy_df = pd.DataFrame(totals).sort_values("Total Consumption (kWh)", ascending=False)
+    resident_insight(insight_top_category_share(df_cat))
 
     fig = px.bar(
-        energy_df,
-        x="Appliance",
+        df_tot,
+        x="Category",
         y="Total Consumption (kWh)",
-        title=f"{apartment_name} - Appliance-wise Total Consumption (kWh)",
-        labels={"Total Consumption (kWh)": "Total Consumption (kWh)"},
+        title=f"{apartment_code} – Total Consumption by Category (kWh)",
+        labels={"Total Consumption (kWh)": "Energy (kWh)"},
     )
-    fig.update_layout(xaxis_tickangle=-45, height=500)
+    fig.update_layout(height=450)
     fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_name}_appliance_wise_{tab_name}")
+    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_cat_energy_{key_suffix}")
 
-def plot_weekday_weekend_comparison(df, apartment_name, tab_name):
+def plot_weekday_weekend_energy_by_category(df_cat: pd.DataFrame, apartment_code: str, key_suffix: str):
     """
-    Average power by appliance (kW), weekdays vs weekends.
-    Cleans appliance labels via strip_apartment_prefix().
+    Weekday vs Weekend energy per day (kWh/day) by category.
+    This keeps units comparable with other energy charts.
     """
-    appliance_cols = get_nonzero_appliance_columns(df)
-    if not appliance_cols or "Timestamp" not in df.columns:
+    if df_cat.empty or "Timestamp" not in df_cat.columns:
         st.info("Not enough data for weekday/weekend comparison.")
         return
 
-    st.caption(insight_weekday_weekend(df))
-
-    data = df.dropna(subset=["Timestamp"]).copy()
-    data["day_type"] = data["Timestamp"].dt.dayofweek.apply(lambda x: "Weekend" if x >= 5 else "Weekday")
-
-    comparison_data = []
-    for col in appliance_cols:
-        weekday_avg = data[data["day_type"] == "Weekday"][col].mean()
-        weekend_avg = data[data["day_type"] == "Weekend"][col].mean()
-        if not np.isnan(weekday_avg) and not np.isnan(weekend_avg):
-            short = strip_apartment_prefix(col, apartment_name)
-            comparison_data.extend(
-                [
-                    {"Appliance": short, "Day Type": "Weekday", "Average Power (kW)": weekday_avg},
-                    {"Appliance": short, "Day Type": "Weekend", "Average Power (kW)": weekend_avg},
-                ]
-            )
-
-    comp_df = pd.DataFrame(comparison_data)
-    if comp_df.empty:
-        st.info("No weekday/weekend comparison data after filtering zero-usage appliances.")
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        st.info("Not enough data for weekday/weekend comparison.")
         return
+
+    d = df_cat.dropna(subset=["Timestamp"]).copy()
+    d["Date"] = d["Timestamp"].dt.date
+    d["DayType"] = d["Timestamp"].dt.dayofweek.apply(lambda x: "Weekend" if x >= 5 else "Weekday")
+
+    # daily kWh by category
+    for c in cats:
+        d[c] = d[c].fillna(0.0) * INTERVAL_HOURS
+
+    daily = d.groupby(["Date", "DayType"], as_index=False)[cats].sum()
+
+    # average kWh/day by day type
+    avg = daily.groupby("DayType", as_index=False)[cats].mean()
+
+    long = avg.melt(id_vars=["DayType"], value_vars=cats, var_name="Category", value_name="kWh_per_day")
+    long = long[long["kWh_per_day"] > 0]  # drop zero categories
+
+    resident_insight(insight_weekday_weekend_delta(df_cat))
 
     fig = px.bar(
-        comp_df,
-        x="Appliance",
-        y="Average Power (kW)",
-        color="Day Type",
+        long,
+        x="Category",
+        y="kWh_per_day",
+        color="DayType",
         barmode="group",
-        title=f"{apartment_name} - Weekday vs Weekend Average Power (kW)",
-        labels={"Average Power (kW)": "Average Power (kW)"},
+        title=f"{apartment_code} – Weekday vs Weekend Energy by Category (kWh/day)",
+        labels={"kWh_per_day": "Energy per day (kWh/day)"},
     )
-    fig.update_layout(xaxis_tickangle=-45, height=500, legend_title_text="Day Type")
+    fig.update_layout(height=450, legend_title_text="Day type")
     fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_name}_weekday_weekend_{tab_name}")
+    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_wkwe_cat_kwh_{key_suffix}")
 
-def plot_hourly_profile(df, apartment_name, tab_name):
-    """
-    Average total power (kW) by hour (single apartment).
-    """
-    if "Timestamp" not in df.columns or df.empty:
-        st.info("No timestamped data available for hourly profile.")
+def plot_time_block_profile(df_cat: pd.DataFrame, apartment_code: str, key_suffix: str):
+    """Average total power (kW) by resident time block."""
+    if df_cat.empty or "Timestamp" not in df_cat.columns:
+        st.info("No timestamped data available.")
+        return
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        st.info("No measurable usage for the selected period.")
         return
 
-    cols = get_nonzero_appliance_columns(df)
-    if not cols:
-        st.info("No measurable appliance usage for hourly profile.")
-        return
+    d = df_cat.dropna(subset=["Timestamp"]).copy()
+    d["Time Block"] = d["Timestamp"].dt.hour.apply(time_block_from_hour)
+    d["Total Power (kW)"] = d[cats].sum(axis=1)
 
-    st.caption(insight_peak_hour(df))
+    block = d.groupby("Time Block", as_index=False)["Total Power (kW)"].mean()
+    block["Time Block"] = pd.Categorical(block["Time Block"], categories=TIME_BLOCK_ORDER, ordered=True)
+    block = block.sort_values("Time Block")
 
-    data = df.dropna(subset=["Timestamp"]).copy()
-    data["hour"] = data["Timestamp"].dt.hour
-    data["Total Power (kW)"] = data[cols].sum(axis=1)
-    hourly = data.groupby("hour")["Total Power (kW)"].mean().reset_index().sort_values("hour")
+    resident_insight(insight_peak_time_block(df_cat))
 
-    fig = px.line(
-        hourly,
-        x="hour",
+    fig = px.bar(
+        block,
+        x="Time Block",
         y="Total Power (kW)",
-        markers=True,
-        title=f"{apartment_name} – Average Power by Hour of Day (kW)",
-        labels={"hour": "Hour of Day", "Total Power (kW)": "Average Power (kW)"},
+        title=f"{apartment_code} – Typical Home Activity by Time of Day (kW)",
+        labels={"Total Power (kW)": "Average power (kW)"},
     )
-    fig.update_layout(xaxis=dict(dtick=1))
+    fig.update_layout(height=450, xaxis_title="")
     fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_name}_hourly_profile_{tab_name}")
+    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_timeblock_{key_suffix}")
 
-def plot_appliance_operation_heatmap(df, apartment_name, tab_name):
+def plot_category_activity_heatmaps(df_cat: pd.DataFrame, apartment_code: str, key_suffix: str):
     """
-    Heatmap: appliance "working harder" occurrences by hour/day (resident-friendly)
-    - hides zero-usage appliances
-    - removes prefixes in appliance names for titles/labels
+    For each category, show when it is active across the week.
+    Metric = share of intervals where category power > ACTIVE_POWER_KW.
+    Uses resident time blocks (not 0-23 hour).
     """
-    cols = get_nonzero_appliance_columns(df)
-    if not cols or "Timestamp" not in df.columns:
-        st.info("No appliance operation pattern available.")
+    if df_cat.empty or "Timestamp" not in df_cat.columns:
+        st.info("No operation pattern available.")
         return
 
-    # Top 5 by energy (kWh)
-    totals = {c: df[c].sum() * INTERVAL_HOURS for c in cols}
-    top_appliances = sorted(totals, key=totals.get, reverse=True)[:5]
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        st.info("No operation pattern available.")
+        return
 
-    st.caption("Insight: Darker cells show periods when an appliance is active more often (working harder).")
+    d = df_cat.dropna(subset=["Timestamp"]).copy()
+    d["Day"] = d["Timestamp"].dt.day_name()
+    d["Time Block"] = d["Timestamp"].dt.hour.apply(time_block_from_hour)
 
-    for i, appliance in enumerate(top_appliances):
-        data = df[["Timestamp", appliance]].copy()
-        data = data.dropna(subset=["Timestamp"])
-        data = data[data[appliance] > 0.01]
-        if data.empty:
-            continue
+    days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-        data["hour"] = data["Timestamp"].dt.hour
-        data["day"] = data["Timestamp"].dt.day_name()
-        days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        pivot = data.groupby(["day", "hour"]).size().unstack(fill_value=0).reindex(days_order)
+    for cat in cats:
+        tmp = d[["Day", "Time Block", cat]].copy()
+        tmp["Active"] = (tmp[cat].fillna(0.0) > ACTIVE_POWER_KW).astype(int)
 
-        short_name = strip_apartment_prefix(appliance, apartment_name)
+        # share of active intervals per day/block
+        pivot = tmp.groupby(["Day", "Time Block"])["Active"].mean().unstack(fill_value=0.0)
+        pivot = pivot.reindex(days_order)
+        pivot = pivot.reindex(columns=TIME_BLOCK_ORDER, fill_value=0.0)
+
+        resident_insight(f"Darker cells show when **{cat}** is active more often during the week.")
+
         fig = px.imshow(
             pivot,
-            title=f"When {short_name} works the hardest during the week",
-            labels=dict(x="Hour of Day", y="Day of Week", color="Working harder"),
+            title=f"{apartment_code} – When {cat} is active during the week",
+            labels=dict(x="Time of day", y="Day of week", color="Active share"),
             aspect="auto",
         )
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True, key=f"{apartment_name}_heatmap_{i}_{tab_name}")
+        fig.update_layout(height=420)
+        st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_cat_heat_{cat}_{key_suffix}")
 
-def plot_on_off_occurrences(df, apartment_name, timeframe="daily", tab_name=""):
+# ================= RESIDENT-FACING ACTIVITY INSIGHTS (replaces ON-events view) =================
+def activity_insights_panel(df_cat: pd.DataFrame, apartment_code: str, key_suffix: str):
     """
-    ON events:
-    - removes prefixes in legend labels
-    - hides zero-usage appliances before event detection
-    - y-axis forced to zero
+    Replace raw ON-event plots with resident-relevant summaries:
+    - Top categories by active hours
+    - Day of highest home energy
+    - Weekend vs weekday difference
     """
-    cols = get_nonzero_appliance_columns(df)
-    if not cols:
-        st.info("No measurable appliance usage for event detection.")
+    if df_cat.empty or "Timestamp" not in df_cat.columns:
+        st.info("No activity insights available for the selected period.")
         return
 
-    st.caption("Insight: This shows how often appliances turn ON (useful to spot frequent cycling).")
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    if not cats:
+        st.info("No activity insights available for the selected period.")
+        return
 
-    occurrences = []
-    for appliance in cols:
-        events = detect_on_off_events(df, appliance)
-        if events.empty:
-            continue
+    # Active hours per category
+    d = df_cat.dropna(subset=["Timestamp"]).copy()
+    for c in cats:
+        d[f"{c}__active"] = (d[c].fillna(0.0) > ACTIVE_POWER_KW).astype(int)
 
-        clean_name = strip_apartment_prefix(appliance, apartment_name)
+    active_hours = []
+    for c in cats:
+        hours = float(d[f"{c}__active"].sum() * INTERVAL_HOURS)
+        if hours > 0:
+            active_hours.append({"Category": c, "Active Hours": hours})
 
-        if timeframe == "daily":
-            events = events.copy()
-            events["date"] = events["Timestamp"].dt.date
-            daily = events.groupby("date").size().reset_index(name="ON_Events")
-            for _, row in daily.iterrows():
-                occurrences.append({"Date": row["date"], "Appliance": clean_name, "ON_Events": row["ON_Events"]})
+    active_df = pd.DataFrame(active_hours).sort_values("Active Hours", ascending=False).head(5)
+
+    # Day of highest energy (kWh)
+    d["Date"] = d["Timestamp"].dt.date
+    d["Total_kWh_interval"] = d[cats].fillna(0.0).sum(axis=1) * INTERVAL_HOURS
+    daily_kwh = d.groupby("Date", as_index=False)["Total_kWh_interval"].sum()
+    peak_day = None
+    if not daily_kwh.empty:
+        peak = daily_kwh.loc[daily_kwh["Total_kWh_interval"].idxmax()]
+        peak_day = (str(peak["Date"]), float(peak["Total_kWh_interval"]))
+
+    # Weekend vs weekday (kWh/day)
+    d["DayType"] = d["Timestamp"].dt.dayofweek.apply(lambda x: "Weekend" if x >= 5 else "Weekday")
+    daily_by_type = d.groupby(["Date", "DayType"], as_index=False)["Total_kWh_interval"].sum()
+    avg_by_type = daily_by_type.groupby("DayType", as_index=False)["Total_kWh_interval"].mean()
+    wk = float(avg_by_type[avg_by_type["DayType"] == "Weekday"]["Total_kWh_interval"].iloc[0]) if "Weekday" in avg_by_type["DayType"].values else np.nan
+    we = float(avg_by_type[avg_by_type["DayType"] == "Weekend"]["Total_kWh_interval"].iloc[0]) if "Weekend" in avg_by_type["DayType"].values else np.nan
+
+    # Panel insights
+    resident_insight("Focus on reducing long ‘idle ON’ time for lights and cooling; small daily reductions add up over a month.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if peak_day:
+            st.metric("Highest activity day", peak_day[0], f"{peak_day[1]:.1f} kWh")
         else:
-            events = events.copy()
-            events["week"] = events["Timestamp"].dt.isocalendar().week
-            events["year"] = events["Timestamp"].dt.year
-            weekly = events.groupby(["year", "week"]).size().reset_index(name="ON_Events")
-            for _, row in weekly.iterrows():
-                occurrences.append(
-                    {"Week": f"{row['year']}-W{row['week']}", "Appliance": clean_name, "ON_Events": row["ON_Events"]}
-                )
+            st.metric("Highest activity day", "NA")
+    with c2:
+        st.metric("Weekday average", f"{wk:.1f} kWh/day" if not np.isnan(wk) else "NA")
+    with c3:
+        st.metric("Weekend average", f"{we:.1f} kWh/day" if not np.isnan(we) else "NA")
 
-    if not occurrences:
-        st.info("No ON events detected after filtering.")
-        return
-
-    occ_df = pd.DataFrame(occurrences)
-
-    if timeframe == "daily":
-        fig = px.line(
-            occ_df,
-            x="Date",
-            y="ON_Events",
-            color="Appliance",
-            title=f"{apartment_name} - Daily ON Events",
-            labels={"ON_Events": "Times turned ON (count)"},
-        )
+    st.markdown("### Top 5 categories by active time")
+    if active_df.empty:
+        st.info("No active usage detected above the activity threshold for the selected period.")
     else:
         fig = px.bar(
-            occ_df,
-            x="Week",
-            y="ON_Events",
-            color="Appliance",
-            title=f"{apartment_name} - Weekly ON Events",
-            barmode="group",
-            labels={"ON_Events": "Times turned ON (count)"},
+            active_df,
+            x="Category",
+            y="Active Hours",
+            title=f"{apartment_code} – Categories active for the longest time (hours)",
+            labels={"Active Hours": "Active time (hours)"},
+        )
+        fig.update_yaxes(rangemode="tozero")
+        st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_active_hours_{key_suffix}")
+
+    with st.expander("How this is calculated"):
+        st.write(
+            f"""
+            - Data resolution: {INTERVAL_MINUTES}-minute intervals.
+            - A category is treated as **active** when power is above **{ACTIVE_POWER_KW:.2f} kW**.
+            - Standby/phantom loads below the threshold are not counted as active time.
+            - Active hours = (number of active intervals) × ({INTERVAL_MINUTES}/60).
+            """
         )
 
-    fig.update_layout(height=500, legend_title_text="Appliance")
-    fig.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_name}_on_off_{timeframe}_{tab_name}")
-
-# ================= EPI (kept) =================
+# ================= EPI (month-clean) =================
 @st.cache_data
 def load_apartment_areas(path="processed_apartments2/metadata/apartment_area.csv"):
     if not os.path.exists(path):
-        st.warning("❌ apartment_area.csv not found.")
+        st.warning("apartment_area.csv not found.")
         return {}
     df = pd.read_csv(path)
     if not {"Apartment", "Area_m2"}.issubset(df.columns):
@@ -710,103 +702,72 @@ def load_apartment_areas(path="processed_apartments2/metadata/apartment_area.csv
     df["key"] = df["Apartment"].apply(normalize_name)
     return dict(zip(df["key"], df["Area_m2"]))
 
-@st.cache_data
-def load_historical_consumption(path="processed_apartments2/metadata/historical_epi.csv"):
-    if not os.path.exists(path):
-        st.warning("⚠️ historical_epi.csv not found.")
-        return pd.DataFrame()
-    df = pd.read_csv(path)
-    required_cols = {"Apartment", "Year", "Month", "Total_kWh"}
-    if not required_cols.issubset(df.columns):
-        st.error("historical_epi.csv must have columns: Apartment, Year, Month, Total_kWh")
-        return pd.DataFrame()
-    df["key"] = df["Apartment"].apply(normalize_name)
-    return df
-
-def plot_epi(selected_apartment, areas, df_full):
+def plot_epi_all_months(apartment_code: str, areas: dict, df_full: pd.DataFrame):
     """
-    Computes and plots EPI (kWh/m²) using ONLY the loaded apartment dataset.
+    Monthly EPI (kWh/m²) computed from full available apartment data (not sidebar range),
+    and displayed as separate months (no merging).
     """
-
     if df_full.empty or "Timestamp" not in df_full.columns:
         st.warning("No timestamped data available for EPI calculation.")
         return
 
+    # Area lookup expects the real apartment name in the metadata file.
+    # Keep reverse mapping internal only; never show real names in UI.
     REAL_NAME_MAP = {v: k for k, v in ANON_MAP.items()}
-    if selected_apartment not in REAL_NAME_MAP:
-        st.error(f"No mapping found for anonymised apartment '{selected_apartment}'.")
+    if apartment_code not in REAL_NAME_MAP:
+        st.warning(f"No area mapping available for {apartment_code}.")
         return
 
-    real_name = REAL_NAME_MAP[selected_apartment]
+    real_name = REAL_NAME_MAP[apartment_code]
     real_key = normalize_name(real_name)
-
     apt_area = areas.get(real_key)
-    if apt_area is None:
-        st.warning(f"Area data not available for apartment {selected_apartment}. EPI normalisation may be approximate.")
-        return
 
-    appliance_cols = get_nonzero_appliance_columns(df_full)
-    if not appliance_cols:
-        st.warning("No measurable appliance energy available for EPI calculation.")
+    if apt_area is None:
+        st.warning(f"Area data not available for {apartment_code}.")
         return
 
     df = df_full.dropna(subset=["Timestamp"]).copy()
-    df["MonthStart"] = df["Timestamp"].dt.to_period("M").dt.to_timestamp()
-    df["TotalPower_kW"] = df[appliance_cols].sum(axis=1)
+    df_cat = aggregate_to_categories(df, apartment_code)
 
-    monthly = (
-        df.groupby("MonthStart", as_index=False)["TotalPower_kW"]
-        .sum()
-        .rename(columns={"TotalPower_kW": "TotalPower_kW_Sum"})
-    )
-    monthly["Total_kWh"] = monthly["TotalPower_kW_Sum"] * INTERVAL_HOURS
+    if df_cat.empty:
+        st.warning("No measurable usage available for EPI calculation.")
+        return
+
+    cats = [c for c in df_cat.columns if c != "Timestamp"]
+    df_cat["MonthStart"] = df_cat["Timestamp"].dt.to_period("M").dt.to_timestamp()
+    df_cat["TotalPower_kW"] = df_cat[cats].sum(axis=1)
+
+    monthly = df_cat.groupby("MonthStart", as_index=False)["TotalPower_kW"].sum()
+    monthly["Total_kWh"] = monthly["TotalPower_kW"] * INTERVAL_HOURS
     monthly["EPI_kWh_per_m2"] = monthly["Total_kWh"] / apt_area
+    monthly = monthly.sort_values("MonthStart")
+    monthly["MonthLabel"] = monthly["MonthStart"].dt.strftime("%b %Y")
 
     if monthly.empty:
         st.warning("No monthly EPI values could be computed.")
         return
 
-    monthly = monthly.sort_values("MonthStart")
-    monthly["MonthLabel"] = monthly["MonthStart"].dt.strftime("%b %Y")
+    first = monthly["MonthLabel"].iloc[0]
+    last = monthly["MonthLabel"].iloc[-1]
+    st.info(f"Data available for EPI: **{first} → {last}**")
 
-    first = monthly["MonthStart"].min().strftime("%b %Y")
-    last = monthly["MonthStart"].max().strftime("%b %Y")
-    st.info(f"📅 **Data available from {first} to {last}**")
-
-    month_labels = monthly["MonthLabel"].tolist()
-    selected_month = st.selectbox("Select Month for EPI", ["All Months"] + month_labels)
-
-    if selected_month == "All Months":
-        df_plot = monthly
-        title = f"EPI Across All Months ({selected_apartment})"
-    else:
-        df_plot = monthly[monthly["MonthLabel"] == selected_month]
-        title = f"EPI for {selected_month} ({selected_apartment})"
+    resident_insight("EPI helps compare your monthly energy use per square metre; lower is better for the same comfort level.")
 
     fig = px.bar(
-        df_plot,
+        monthly,
         x="MonthLabel",
         y="EPI_kWh_per_m2",
-        title=title,
+        title=f"{apartment_code} – Monthly Energy Performance Index (kWh/m²)",
         labels={"MonthLabel": "Month", "EPI_kWh_per_m2": "EPI (kWh/m²)"},
     )
     fig.update_yaxes(rangemode="tozero")
     fig.update_layout(xaxis=dict(type="category"))
-    st.plotly_chart(fig, use_container_width=True)
-
-    if selected_month == "All Months":
-        peak = df_plot.loc[df_plot["EPI_kWh_per_m2"].idxmax()]
-        st.caption(
-            f"💡 **Insight:** Your highest EPI was in **{peak['MonthLabel']}**, indicating higher energy use per square metre."
-        )
-    else:
-        val = float(df_plot["EPI_kWh_per_m2"].iloc[0])
-        st.caption(f"💡 **Insight:** Your EPI for **{selected_month}** is **{val:.2f} kWh/m²**.")
+    st.plotly_chart(fig, use_container_width=True, key=f"{apartment_code}_epi_all")
 
 # ================= MAIN APP =================
 def main():
     st.set_page_config(page_title="Apartment Energy Analytics", layout="wide")
-    st.title("🏢 Residential Energy Consumption Dashboard")
+    st.title("Residential Energy Consumption Dashboard")
 
     with st.spinner("Loading apartment data..."):
         all_dfs = load_all_data()
@@ -815,16 +776,15 @@ def main():
         st.error("No data files found. Please check the DATA_FOLDER path.")
         st.stop()
 
-    st.success(f"✅ Loaded data for {len(all_dfs)} apartments")
+    st.success(f"Loaded data for {len(all_dfs)} apartments")
 
     areas = load_apartment_areas()
-    historical_df = load_historical_consumption()
 
     st.sidebar.header("Apartment Selection")
     apartment_names = sorted(list(all_dfs.keys()))
     selected_option = st.sidebar.selectbox("Select Option", ["All Apartments"] + apartment_names)
 
-    st.sidebar.subheader("📆 Date Range Filter")
+    st.sidebar.subheader("Date Range Filter")
     all_timestamps = pd.concat([df["Timestamp"] for df in all_dfs.values() if "Timestamp" in df.columns], ignore_index=True)
     all_timestamps = all_timestamps.dropna()
     if all_timestamps.empty:
@@ -842,94 +802,135 @@ def main():
 
     # ================= ALL APARTMENTS VIEW =================
     if selected_option == "All Apartments":
-        st.header("🏘️ All Apartments - Comparative Analysis")
+        st.header("All Apartments – Comparative View")
 
+        # Apply date filter
+        filtered = {}
         for apt, df_apt in all_dfs.items():
             if "Timestamp" in df_apt.columns:
                 mask = (df_apt["Timestamp"] >= start_date) & (df_apt["Timestamp"] <= end_date)
-                all_dfs[apt] = df_apt[mask]
+                filtered[apt] = df_apt[mask]
+            else:
+                filtered[apt] = df_apt
 
-        st.caption("Insight: Use this view to compare typical daily patterns and weekend effects across homes.")
-        plot_hourly_consumption_all_apartments(all_dfs)
-        plot_weekday_weekend_comparison_all_apartments(all_dfs)
+        resident_insight("Use this view to compare typical daily activity patterns across homes.")
+
+        # Simple comparison: total average power by time block
+        rows = []
+        for apt, df_apt in filtered.items():
+            if "Timestamp" not in df_apt.columns or df_apt.empty:
+                continue
+            df_cat = aggregate_to_categories(df_apt, apt)
+            if df_cat.empty:
+                continue
+            cats = [c for c in df_cat.columns if c != "Timestamp"]
+            d = df_cat.dropna(subset=["Timestamp"]).copy()
+            d["Time Block"] = d["Timestamp"].dt.hour.apply(time_block_from_hour)
+            d["Total Power (kW)"] = d[cats].sum(axis=1)
+            agg = d.groupby("Time Block")["Total Power (kW)"].mean().reindex(TIME_BLOCK_ORDER)
+            for tb, val in agg.items():
+                rows.append({"Apartment": apt, "Time Block": tb, "Average Power (kW)": val})
+
+        if not rows:
+            st.warning("No comparable data available for the selected range.")
+            return
+
+        comp_df = pd.DataFrame(rows)
+        fig = px.scatter(
+            comp_df,
+            x="Time Block",
+            y="Average Power (kW)",
+            color="Apartment",
+            title="Typical Home Activity by Time Block (kW)",
+            labels={"Average Power (kW)": "Average power (kW)"},
+        )
+        fig.update_traces(marker=dict(size=8, opacity=0.75))
+        fig.update_yaxes(rangemode="tozero")
+        st.plotly_chart(fig, use_container_width=True)
+
         return
 
     # ================= INDIVIDUAL APARTMENT VIEW =================
-    selected_apartment = selected_option
-    if selected_apartment not in all_dfs:
+    apartment_code = selected_option  # already anonymised
+    if apartment_code not in all_dfs:
         st.error("Selected apartment data not found.")
         return
 
-    df_full = all_dfs[selected_apartment].copy()
+    df_full = all_dfs[apartment_code].copy()
     df = df_full.copy()
     if "Timestamp" in df.columns:
         df = df[(df["Timestamp"] >= start_date) & (df["Timestamp"] <= end_date)]
 
     st.sidebar.subheader("Apartment Info")
-    st.sidebar.write(f"**Apartment:** {selected_apartment}")
-    st.sidebar.write(f"**Filtered Records:** {len(df)}")
+    st.sidebar.write(f"Apartment: {apartment_code}")
+    st.sidebar.write(f"Filtered records: {len(df)}")
     if not df.empty and "Timestamp" in df.columns:
-        st.sidebar.write(f"**Date Range:** {df['Timestamp'].min().strftime('%Y-%m-%d')} → {df['Timestamp'].max().strftime('%Y-%m-%d')}")
+        st.sidebar.write(f"Date range: {df['Timestamp'].min().strftime('%Y-%m-%d')} → {df['Timestamp'].max().strftime('%Y-%m-%d')}")
 
-    st.header(f"Energy Analytics for {selected_apartment}")
+    st.header(f"Energy Analytics – {apartment_code}")
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📈 Overview", "🔌 Appliance Usage", "📅 Time Analysis", "❄️ AC & Weather", "🔄 ON Events", "📊 EPI Analysis"]
+        ["Overview", "Category Patterns", "Time Analysis", "AC & Weather", "Activity Insights", "EPI (Monthly)"]
     )
 
-    with tab1:
-        st.subheader("Energy Overview")
-        plot_energy_consumption_over_time(df, selected_apartment, "overview")
+    # Pre-compute category aggregation for this filtered window
+    df_cat = aggregate_to_categories(df, apartment_code)
 
-        cols = get_nonzero_appliance_columns(df)
-        total_kwh = df[cols].sum(numeric_only=True).sum() * INTERVAL_HOURS if cols else 0
-        avg_power_kw = df[cols].sum(axis=1).mean() if cols else 0
+    with tab1:
+        st.subheader("Energy Overview (Major Categories)")
+
+        plot_category_power_over_time(df_cat, apartment_code, "overview")
+
+        # KPI row
+        cats = [c for c in df_cat.columns if c != "Timestamp"] if not df_cat.empty else []
+        total_kwh = float(df_cat[cats].fillna(0.0).sum().sum() * INTERVAL_HOURS) if cats else 0.0
+        avg_power_kw = float(df_cat[cats].fillna(0.0).sum(axis=1).mean()) if cats else 0.0
 
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("Total Consumption (kWh)", f"{total_kwh:.2f}")
+            st.metric("Total consumption (kWh)", f"{total_kwh:.1f}")
         with c2:
-            st.metric("Average Power (kW)", f"{avg_power_kw:.2f}")
+            st.metric("Average power (kW)", f"{avg_power_kw:.2f}")
 
         colA, colB = st.columns(2)
         with colA:
-            plot_appliance_wise_energy(df, selected_apartment, "overview")
+            plot_category_energy_bar(df_cat, apartment_code, "overview")
         with colB:
-            plot_weekday_weekend_comparison(df, selected_apartment, "overview")
+            plot_weekday_weekend_energy_by_category(df_cat, apartment_code, "overview")
 
     with tab2:
-        st.subheader("Appliance Operation Patterns")
-        plot_appliance_operation_heatmap(df, selected_apartment, "appliance_usage")
+        st.subheader("When Categories Are Active During the Week")
+        plot_category_activity_heatmaps(df_cat, apartment_code, "patterns")
 
     with tab3:
         st.subheader("Time-based Patterns")
-        plot_hourly_profile(df, selected_apartment, "time_analysis")
-        #plot_weekday_weekend_comparison(df, selected_apartment, "time_analysis")
+        plot_time_block_profile(df_cat, apartment_code, "time")
 
     with tab4:
         st.subheader("AC & Weather")
-        st.caption("Insight: This helps explain why AC energy rises on hotter or more humid days.")
-        RMI_LAKESIDE_CODE = ANON_MAP.get("Lakeside K 502", "LAKNW05")
-        if selected_apartment.strip().lower() == RMI_LAKESIDE_CODE.strip().lower():
+        resident_insight("This shows whether hotter or more humid periods align with higher cooling use.")
+
+        # Current build: weather configured only for LAKNW05 (display only anonymised code)
+        WEATHER_APT_CODE = ANON_MAP.get("Lakeside K 502", "LAKNW05")
+        if apartment_code.strip().lower() == WEATHER_APT_CODE.strip().lower():
             weather_dict = load_weather_data()
             if weather_dict:
                 for zone, weather_df in weather_dict.items():
-                    safe_zone = str(zone).replace("Lakeside K 502", RMI_LAKESIDE_CODE)
-                    st.markdown(f"### 🏠 {safe_zone} Bedroom")
-                    plot_weather_correlation(df, weather_df)
+                    st.markdown(f"### Zone: {zone}")
+                    plot_weather_correlation(df, weather_df, apartment_code)
             else:
                 st.warning("No weather files found for this apartment.")
         else:
-            st.info(f"Weather files are configured only for apartment {RMI_LAKESIDE_CODE} in the current build.")
+            st.info(f"Weather correlation is available only for {WEATHER_APT_CODE} in the current build.")
 
     with tab5:
-        st.subheader("Appliance ON Events (Count of Occurences of Power (kW) more than the specified threshold)")
-        timeframe = st.radio("Select Timeframe", ["daily", "weekly"], horizontal=True)
-        plot_on_off_occurrences(df, selected_apartment, timeframe, "on_events")
+        st.subheader("Activity Insights")
+        activity_insights_panel(df_cat, apartment_code, "activity")
 
     with tab6:
-        st.subheader("Energy Performance Index (EPI)")
-        plot_epi(selected_apartment, areas, df)
+        st.subheader("Energy Performance Index (Monthly EPI)")
+        # IMPORTANT: use full data to avoid partial-month ambiguity
+        plot_epi_all_months(apartment_code, areas, df_full)
 
 if __name__ == "__main__":
     main()
